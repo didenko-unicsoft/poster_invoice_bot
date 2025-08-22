@@ -1,109 +1,214 @@
 import os
-import time
+import json
 import logging
-from typing import Any, Dict, Optional, Tuple
+import asyncio
+from typing import Dict, Any, List, Optional, Tuple
+import aiohttp
+from datetime import datetime
 
-import requests
-
-# --- Конфіг ---
-POSTER_API_TOKEN = os.environ.get("POSTER_API_TOKEN", "").strip()
-if not POSTER_API_TOKEN:
-    raise RuntimeError("POSTER_API_TOKEN is not set")
-
-# Правильний базовий URL Poster API:
-POSTER_API_BASE = os.getenv("POSTER_API_BASE", "https://joinposter.com/api").rstrip("/")
-
-# Методи Poster API
-METHOD_GET_SUPPLIERS = "suppliers.getSuppliers"
-METHOD_GET_PRODUCTS = "menu.getProducts"
-METHOD_CREATE_SUPPLY = "storage.createSupply"     # <= ключовий фікс
-
-# Ретраї 0/3/5/8 сек за замовчанням
-RETRY_DELAYS = (0, 3, 5, 8)
+log = logging.getLogger("poster")
 
 class PosterAPIError(Exception):
-    def __init__(self, status: int, message: str, url: str = ""):
-        super().__init__(f"[{status}] {message}")
-        self.status = status
-        self.url = url
-        self.message = message
+    pass
 
+class PosterClient:
+    def __init__(self, token: str):
+        self.token = token.strip()
+        if not self.token:
+            raise RuntimeError("POSTER_API_TOKEN is not set")
 
-def _request(
-    method: str,
-    http: str = "GET",
-    params: Optional[Dict[str, Any]] = None,
-    json: Optional[Dict[str, Any]] = None,
-    retry_delays: Tuple[int, ...] = RETRY_DELAYS,
-) -> Dict[str, Any]:
-    """
-    Виконує запит до Poster API:
-    - token передаємо в query (?token=...)
-    - GET для *get* методів, POST для створення/оновлення
-    - ретраї 0/3/5/8 сек
-    """
-    if params is None:
-        params = {}
-    url = f"{POSTER_API_BASE}/{method}"
-    query = {"token": POSTER_API_TOKEN, **params}
+        # БАЗА з env (у тебе: https://vfm.joinposter.com/api)
+        self.base = os.getenv("POSTER_API_BASE", "https://joinposter.com/api").rstrip("/")
 
-    last_err = None
-    for i, delay in enumerate(retry_delays):
-        try:
+        # Методи з env (можеш перевизначити в Railway Variables)
+        self.m_get_products = os.getenv("POSTER_PRODUCTS_METHOD", "menu.getProducts")
+        self.m_get_suppliers = os.getenv("POSTER_SUPPLIERS_METHOD", "suppliers.getSuppliers")
+
+        # ГОЛОВНИЙ ФІКС: дефолтно використовуємо storage.createSupply
+        self.m_create_supply = os.getenv("POSTER_CREATE_SUPPLY_METHOD", "storage.createSupply")
+
+        # Додаткові спроби якщо 404
+        self._create_fallbacks = [
+            self.m_create_supply,
+            "storage.createSupply",
+            "incomingOrders.createIncomingOrder",
+            "incomingOrders.createSupply",
+        ]
+
+        # Необов'язкові env
+        self.storage_id = os.getenv("POSTER_STORAGE_ID")  # якщо знаєш ID складу – задай тут
+        self._retries = (0, 3, 5, 8)
+
+    async def _request(
+        self,
+        method: str,
+        params: Optional[Dict[str, Any]] = None,
+        payload: Optional[Dict[str, Any]] = None,
+        retries: Tuple[int, ...] = None,
+    ) -> Dict[str, Any]:
+        params = dict(params or {})
+        params["token"] = self.token
+        params.setdefault("format", "json")  # форсуємо json
+        url = f"{self.base}/{method}"
+
+        retries = retries or self._retries
+        last_exc = None
+        for attempt, delay in enumerate(retries):
             if delay:
-                time.sleep(delay)
-            if http.upper() == "GET":
-                resp = requests.get(url, params=query, timeout=30)
-            else:
-                # В Poster тіло краще віддавати як JSON, а token – в query
-                resp = requests.post(url, params=query, json=json or {}, timeout=30)
+                await asyncio.sleep(delay)
+            try:
+                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=40)) as session:
+                    if payload is None:
+                        async with session.get(url, params=params) as resp:
+                            body = await resp.text()
+                            if resp.status >= 400:
+                                raise PosterAPIError(f"{resp.status} {url} :: {body[:400]}")
+                            return await resp.json(content_type=None)
+                    else:
+                        async with session.post(url, params=params, json=payload) as resp:
+                            body = await resp.text()
+                            if resp.status >= 400:
+                                raise PosterAPIError(f"{resp.status} {url} :: {body[:400]}")
+                            return await resp.json(content_type=None)
+            except Exception as e:
+                last_exc = e
+                log.warning("Poster API error (%s). URL: %s. Retry in %ss", e, url, delay)
+        raise PosterAPIError(str(last_exc))
 
-            # Явно обробляємо 404 щоб його було видно в логах
-            if resp.status_code == 404:
-                raise PosterAPIError(404, f"Not found. Body: {resp.text[:300]}", url=resp.url)
+    # ---------- Довідники ----------
+    async def get_suppliers(self) -> List[Dict[str, Any]]:
+        data = await self._request(self.m_get_suppliers)
+        arr = data.get("response") if isinstance(data, dict) else data
+        items = []
+        if isinstance(arr, list):
+            for s in arr:
+                items.append({
+                    "id": s.get("supplier_id") or s.get("id"),
+                    "name": s.get("name") or s.get("supplier_name"),
+                })
+        elif isinstance(arr, dict) and "suppliers" in arr:
+            for s in arr["suppliers"]:
+                items.append({
+                    "id": s.get("supplier_id") or s.get("id"),
+                    "name": s.get("name") or s.get("supplier_name"),
+                })
+        return [x for x in items if x.get("id") and x.get("name")]
 
-            resp.raise_for_status()
+    async def get_products(self) -> List[Dict[str, Any]]:
+        params = {"with_barcode": 1, "with_sku": 1}
+        data = await self._request(self.m_get_products, params=params)
+        arr = data.get("response") if isinstance(data, dict) else data
+        items = []
+        if isinstance(arr, list):
+            for p in arr:
+                items.append({
+                    "id": p.get("product_id") or p.get("id"),
+                    "name": p.get("name") or p.get("product_name"),
+                    "barcode": p.get("barcode"),
+                    "sku": p.get("sku") or p.get("product_code"),
+                })
+        elif isinstance(arr, dict) and "products" in arr:
+            for p in arr["products"]:
+                items.append({
+                    "id": p.get("product_id") or p.get("id"),
+                    "name": p.get("name") or p.get("product_name"),
+                    "barcode": p.get("barcode"),
+                    "sku": p.get("sku") or p.get("product_code"),
+                })
+        return [x for x in items if x.get("id") and x.get("name")]
 
-            # Poster повертає JSON; інколи поле error
-            data = resp.json()
-            if isinstance(data, dict) and data.get("error"):
-                err = data["error"]
-                raise PosterAPIError(int(err.get("code", 400)), str(err.get("message", "Poster API error")), url=resp.url)
+    # ---------- Створення приходу ----------
+    async def create_supply_from_parsed(self, parsed: Dict[str, Any], default_tax: float = 0.0) -> Any:
+        """
+        Робимо payload і пробуємо кілька методів:
+        - storage.createSupply  (переважно для приходу на склад)
+        - incomingOrders.createIncomingOrder / incomingOrders.createSupply  (фолбеки)
+        """
+        # Загальні поля
+        supplier_id = parsed.get("supplier_id")
+        supplier_name = parsed.get("supplier")
+        invoice_number = parsed.get("invoice_number")
+        invoice_date = parsed.get("invoice_date") or datetime.utcnow().strftime("%Y-%m-%d")
+        currency = parsed.get("currency")
+        items = parsed.get("items", [])
 
-            return data
+        # 1) payload для storage.createSupply (інгредієнти/товари на склад)
+        supply_block = {
+            "date": f"{invoice_date} 12:00:00",
+        }
+        if supplier_id:
+            supply_block["supplier_id"] = supplier_id
+        else:
+            # деякі акаунти приймають name, інші – лише id
+            supply_block["supplier_name"] = supplier_name or "Unknown"
 
-        except PosterAPIError as e:
-            last_err = e
-            logging.warning("Poster API error (%s), retrying in %ss...", e, delay)
-        except requests.RequestException as e:
-            last_err = e
-            logging.warning("HTTP error calling Poster (%s), retrying in %ss...", e, delay)
+        if self.storage_id:
+            supply_block["storage_id"] = int(self.storage_id)
 
-    # Якщо сюди дійшли — всі спроби вичерпано
-    if isinstance(last_err, PosterAPIError):
-        raise last_err
-    raise PosterAPIError(500, f"Failed to call Poster method {method}: {last_err}", url=url)
+        # елементи приходу
+        ingredients = []
+        for it in items:
+            q = float(it.get("quantity") or 0)
+            price = float(it.get("price") or 0)
+            tax = it.get("tax")
+            row = {
+                # Poster часто приймає або id, або name
+                "id": it.get("product_id"),
+                "name": it.get("name"),
+                "num": q,
+                "price": price,
+            }
+            if tax is not None:
+                row["tax"] = float(tax)
+            ingredients.append(row)
 
+        storage_payload = {
+            "supply": supply_block,
+            "ingredient": ingredients,   # інколи ключ може бути 'products' — але більшість акаунтів приймає 'ingredient'
+            "invoice": {
+                "number": invoice_number,
+                "currency": currency
+            }
+        }
 
-# --- Публічні обгортки ---
+        # 2) універсальний payload для incomingOrders.* (якщо storage.* відсутній)
+        generic_items = []
+        for it in items:
+            generic_items.append({
+                "product_id": it.get("product_id"),
+                "product_name": it.get("name"),
+                "quantity": float(it.get("quantity") or 0),
+                "price": float(it.get("price") or 0),
+                "tax": float(it.get("tax")) if it.get("tax") is not None else default_tax
+            })
+        generic_payload = {
+            "supplier_id": supplier_id,
+            "supplier_name": supplier_name if not supplier_id else None,
+            "invoice_number": invoice_number,
+            "invoice_date": invoice_date,
+            "currency": currency,
+            "items": generic_items,
+            "comment": "Created by Telegram import bot"
+        }
 
-def get_suppliers(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Отримати довідник постачальників"""
-    return _request(METHOD_GET_SUPPLIERS, http="GET", params=params or {})
-
-
-def get_products(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Отримати довідник товарів/продуктів (для матчингу за barcode/SKU)"""
-    # За потреби можна додати пагінацію через 'page'/'limit'
-    return _request(METHOD_GET_PRODUCTS, http="GET", params=params or {})
-
-
-def create_supply(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Створити прихідну накладну в Poster.
-    Очікуваний формат payload згідно Poster: {
-      "supply": { "date": "YYYY-mm-dd HH:MM:SS", "supplier_id": "...", "storage_id": "...", "packing": "1" },
-      "ingredient": [ { "id": "138", "type": "1", "num": "3", "sum": "6" }, ... ]
-    }
-    """
-    return _request(METHOD_CREATE_SUPPLY, http="POST", json=payload)
+        # Ланцюжок спроб
+        last_err = None
+        for method in self._create_fallbacks:
+            try:
+                payload = storage_payload if method.startswith("storage.") else generic_payload
+                res = await self._request(method, payload=payload)
+                resp = res.get("response") if isinstance(res, dict) else res
+                supply_id = None
+                if isinstance(resp, dict):
+                    supply_id = resp.get("supply_id") or resp.get("id") or resp.get("number")
+                if supply_id is None and isinstance(resp, list) and resp:
+                    supply_id = resp[0].get("id")
+                log.info("Poster supply created via %s → %s", method, supply_id or "unknown")
+                return supply_id or "unknown"
+            except Exception as e:
+                last_err = e
+                log.warning("Create supply failed via %s: %s", method, e)
+                # якщо це не 404 – не крутимо фолбеки безкінечно
+                if " 404 " not in str(e):
+                    break
+        raise PosterAPIError(f"Create supply failed. Last error: {last_err}")
