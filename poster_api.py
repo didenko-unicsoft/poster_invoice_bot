@@ -103,12 +103,11 @@ class PosterClient:
 
     # -------------------- Довідники --------------------
 
-    async def get_suppliers(self) -> List[Dict[str, Any]]:
+        async def get_suppliers(self) -> List[Dict[str, Any]]:
         """
-        Повертає [{"id": ..., "name": ...}, ...]
-        Послідовно пробуємо кілька методів; першим — clients.getSuppliers.
+        Якщо довідник постачальників недоступний (404/empty), повертаємо пустий список.
+        Бот далі створює прихід з supplier_name напряму.
         """
-        last_err = None
         for method in self._suppliers_methods:
             try:
                 data = await self._request(method)
@@ -122,7 +121,6 @@ class PosterClient:
                             "name": s.get("name") or s.get("supplier_name"),
                         })
                 elif isinstance(arr, dict):
-                    # можливі ключі: "suppliers", "contractors"
                     src = arr.get("suppliers") or arr.get("contractors") or []
                     for s in src:
                         items.append({
@@ -135,19 +133,14 @@ class PosterClient:
                     log.info("Suppliers fetched via %s: %d", method, len(items))
                     return items
 
-                last_err = PosterAPIError(f"Empty suppliers response via {method}")
-                log.warning("get_suppliers via %s: empty response", method)
-
             except Exception as e:
-                last_err = e
-                # Якщо 404 — просто ідемо далі на наступний метод, без паніки
                 if " 404 " in str(e):
-                    log.info("get_suppliers via %s failed with 404 (URL в логах). Пробую наступний метод.", method)
+                    log.info("Suppliers via %s not available (404).", method)
                 else:
                     log.warning("get_suppliers via %s failed: %s", method, e)
 
-        # Якщо все впало/порожньо — повертаємо пустий список (бот запитає мапінг у користувача)
-        log.error("All supplier methods failed, last error: %s", last_err)
+        # Якщо нічого не знайшли — просто повертаємо пустий список
+        log.warning("No suppliers found in API, will use supplier_name directly.")
         return []
 
     async def get_products(self) -> List[Dict[str, Any]]:
