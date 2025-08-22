@@ -1,5 +1,4 @@
 import os
-import json
 import logging
 import asyncio
 from typing import Dict, Any, List, Optional, Tuple
@@ -8,13 +7,14 @@ from datetime import datetime
 
 log = logging.getLogger("poster")
 
+
 class PosterAPIError(Exception):
     pass
 
 
 class PosterClient:
     """
-    Легкий async-клієнт Poster API з fallback-ами під різні акаунти.
+    Async клієнт Poster API з фолбеками під різні акаунти.
     Працює з базою з ENV: POSTER_API_BASE = https://<account>.joinposter.com/api
     """
     def __init__(self, token: str):
@@ -22,32 +22,39 @@ class PosterClient:
         if not self.token:
             raise RuntimeError("POSTER_API_TOKEN is not set")
 
-        # База з ENV (у тебе: https://vfm.joinposter.com/api)
+        # У тебе це: https://vfm.joinposter.com/api
         self.base = os.getenv("POSTER_API_BASE", "https://joinposter.com/api").rstrip("/")
 
-        # Можна перевизначити через ENV, але є готові дефолти
+        # Продукти: за замовчуванням menu.getProducts
         self.m_get_products = os.getenv("POSTER_PRODUCTS_METHOD", "menu.getProducts")
 
-        # На різних акаунтах метод постачальників відрізняється — тримаємо список спроб
+        # ======== SUPPLIERS: порядок спроб (спочатку clients.getSuppliers!) ========
         env_sup = os.getenv("POSTER_SUPPLIERS_METHOD")
-        self._suppliers_methods = [env_sup] if env_sup else []
-        # додамо поширені варіанти (порядок важливий)
-        self._suppliers_methods += [
-            "clients.getSuppliers",
-            "suppliers.getSuppliers",
-            "clients.getContractors",     # зустрічається як синонім у деяких інсталяціях
-        ]
+        self._suppliers_methods: List[str] = []
 
-        # Створення приходу: основний метод + фолбеки
+        # Завжди починаємо з clients.getSuppliers — він зазвичай працює на PRO-доменах
+        self._suppliers_methods.append("clients.getSuppliers")
+
+        # Якщо користувач явно задав метод у Variables — спробуємо його другим
+        if env_sup and env_sup not in self._suppliers_methods:
+            self._suppliers_methods.append(env_sup)
+
+        # Інші поширені варіанти
+        for cand in ("suppliers.getSuppliers", "clients.getContractors"):
+            if cand not in self._suppliers_methods:
+                self._suppliers_methods.append(cand)
+
+        # ======== CREATE SUPPLY: головний + фолбеки ========
         env_create = os.getenv("POSTER_CREATE_SUPPLY_METHOD")
-        self._create_methods = [env_create] if env_create else []
-        self._create_methods += [
-            "storage.createSupply",               # основний для приходу на склад
-            "incomingOrders.createIncomingOrder", # фолбек (у деяких акаунтах саме він є)
-            "incomingOrders.createSupply",        # ще один фолбек
-        ]
+        self._create_methods: List[str] = []
+        # основний
+        self._create_methods.append(env_create or "storage.createSupply")
+        # фолбеки
+        for cand in ("incomingOrders.createIncomingOrder", "incomingOrders.createSupply"):
+            if cand not in self._create_methods:
+                self._create_methods.append(cand)
 
-        # (опц.) ID складу, якщо кілька локацій
+        # (опц.) ID складу (spot/storage), якщо кілька локацій
         self.storage_id = os.getenv("POSTER_STORAGE_ID")
 
         # Ретраї 0/3/5/8 сек
@@ -68,9 +75,9 @@ class PosterClient:
         url = f"{self.base}/{method}"
 
         retries = retries or self._retries
-        last_exc = None
+        last_exc: Optional[Exception] = None
 
-        for attempt, delay in enumerate(retries):
+        for delay in retries:
             if delay:
                 await asyncio.sleep(delay)
             try:
@@ -80,7 +87,6 @@ class PosterClient:
                             body = await resp.text()
                             if resp.status >= 400:
                                 raise PosterAPIError(f"{resp.status} {url} :: {body[:400]}")
-                            # інколи приходить text/html з JSON усередині
                             return await resp.json(content_type=None)
                     else:
                         async with session.post(url, params=params, json=payload) as resp:
@@ -90,16 +96,17 @@ class PosterClient:
                             return await resp.json(content_type=None)
             except Exception as e:
                 last_exc = e
+                # Не шумимо зайвим, просто інформативний лог і рухаємось далі
                 log.warning("Poster API error (%s). URL: %s. Retry in %ss", e, url, delay)
 
-        raise PosterAPIError(str(last_exc))
+        raise PosterAPIError(str(last_exc) if last_exc else f"Request failed: {url}")
 
     # -------------------- Довідники --------------------
 
     async def get_suppliers(self) -> List[Dict[str, Any]]:
         """
-        Повертає список постачальників у нормалізованому вигляді: [{"id": ..., "name": ...}, ...]
-        Перебирає кілька можливих методів доки один не відповість 200 + JSON.
+        Повертає [{"id": ..., "name": ...}, ...]
+        Послідовно пробуємо кілька методів; першим — clients.getSuppliers.
         """
         last_err = None
         for method in self._suppliers_methods:
@@ -127,19 +134,25 @@ class PosterClient:
                 if items:
                     log.info("Suppliers fetched via %s: %d", method, len(items))
                     return items
-                # Якщо структура пуста — пробуємо наступний метод
+
                 last_err = PosterAPIError(f"Empty suppliers response via {method}")
+                log.warning("get_suppliers via %s: empty response", method)
+
             except Exception as e:
                 last_err = e
-                log.warning("get_suppliers via %s failed: %s", method, e)
+                # Якщо 404 — просто ідемо далі на наступний метод, без паніки
+                if " 404 " in str(e):
+                    log.info("get_suppliers via %s failed with 404 (URL в логах). Пробую наступний метод.", method)
+                else:
+                    log.warning("get_suppliers via %s failed: %s", method, e)
 
-        # Якщо все погано — віддаємо порожній список (щоб бот запитав маппінг у користувача)
+        # Якщо все впало/порожньо — повертаємо пустий список (бот запитає мапінг у користувача)
         log.error("All supplier methods failed, last error: %s", last_err)
         return []
 
     async def get_products(self) -> List[Dict[str, Any]]:
         """
-        Отримує продукти/товари для матчингу.
+        Отримує продукти/товари для матчингу (за замовчуванням menu.getProducts).
         """
         params = {"with_barcode": 1, "with_sku": 1}
         data = await self._request(self.m_get_products, params=params)
@@ -173,7 +186,7 @@ class PosterClient:
     async def create_supply_from_parsed(self, parsed: Dict[str, Any], default_tax: float = 0.0) -> Any:
         """
         Створює прихід у Poster. Послідовно пробує методи зі списку _create_methods.
-        Повертає supply_id / number (що надасть API) або 'unknown'.
+        Повертає supply_id/number або 'unknown'.
         """
         supplier_id = parsed.get("supplier_id")
         supplier_name = parsed.get("supplier")
@@ -182,14 +195,14 @@ class PosterClient:
         currency = parsed.get("currency")
         items = parsed.get("items", [])
 
-        # payload для storage.createSupply (інвентаризація)
+        # payload для storage.createSupply
         supply_block: Dict[str, Any] = {
             "date": f"{invoice_date} 12:00:00",
         }
         if supplier_id:
             supply_block["supplier_id"] = supplier_id
         elif supplier_name:
-            # якщо акаунт приймає name
+            # деякі акаунти приймають name
             supply_block["supplier_name"] = supplier_name
 
         if self.storage_id:
@@ -214,7 +227,7 @@ class PosterClient:
 
         storage_payload = {
             "supply": supply_block,
-            "ingredient": ingredients,  # деякі акаунти ще приймають ключ 'products'
+            "ingredient": ingredients,  # в окремих акаунтах ключ може бути 'products'
             "invoice": {
                 "number": invoice_number,
                 "currency": currency
@@ -258,8 +271,8 @@ class PosterClient:
                 return supply_id or "unknown"
             except Exception as e:
                 last_err = e
-                # якщо це не 404 — не ганяємо всю карусель
                 log.warning("Create supply failed via %s: %s", method, e)
+                # якщо це не 404 — далі немає сенсу ганяти всі фолбеки
                 if " 404 " not in str(e):
                     break
 
